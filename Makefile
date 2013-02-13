@@ -1,5 +1,5 @@
 # Comment/uncomment the following line to disable/enable debugging
-#DEBUG = y
+DEBUG = y
 
 # Comment this line to get more verbose messages from this Makefile
 V=@

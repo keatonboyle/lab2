@@ -291,7 +291,15 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
         {
           if(wait_event_interruptible(d->blockq,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)) == -ERESTARTSYS)
+          {
+            //eprintk("Ticket #%d for %d got signal!\n",local_ticket,filp_writable);
+            //eprintk("Ticket #%d shall die!\n",local_ticket);
+            osp_spin_lock(&d->mutex);
+            if(d->ticket_tail == local_ticket)
+              d->ticket_tail++;
+            osp_spin_unlock(&d->mutex);
             return -ERESTARTSYS;
+          }
           //eprintk("Ticket #%d is about to go to work(read) %d\n",local_ticket,filp_writable);
           osp_spin_lock(&d->mutex);
           if(d->w_lock != 0)

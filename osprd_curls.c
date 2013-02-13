@@ -325,7 +325,13 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
           if(wait_event_interruptible(d->blockq,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)
               && (d->r_locks == 0)) == -ERESTARTSYS)
+          {
+            osp_spin_lock(&d->mutex);
+            if(d->ticket_tail == local_ticket)
+              d->ticket_tail++;
+            osp_spin_unlock(&d->mutex);          
             return -ERESTARTSYS;
+          }
           //eprintk("Ticket #%d is about to go to work(write) %d\n",local_ticket,filp_writable);
           osp_spin_lock(&d->mutex);
           if((d->w_lock != 0) || (d->r_locks != 0))

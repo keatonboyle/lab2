@@ -288,8 +288,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 		// Your code here (instead of the next two lines).
 		
-    if((filp->f_flags & F_OSPRD_LOCKED) == F_OSPRD_LOCKED)
-      return -EDEADLK;		
+    /*if((filp->f_flags & F_OSPRD_LOCKED) == F_OSPRD_LOCKED)
+      return -EDEADLK;*/
 		
 		osp_spin_lock(&d->mutex);
 		unsigned local_ticket = d->ticket_head++;
@@ -433,8 +433,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 		// Your code here (instead of the next two lines).
 		
-		if((filp->f_flags & F_OSPRD_LOCKED) == F_OSPRD_LOCKED)
-      return -EBUSY;
+		/*if((filp->f_flags & F_OSPRD_LOCKED) == F_OSPRD_LOCKED)
+      return -EBUSY;*/
 		
     osp_spin_lock(&d->mutex);
     if(d->ticket_head != d->ticket_tail)

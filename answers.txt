@@ -9,9 +9,9 @@
 # the end of the file.
 
 # Partner 1
-Name: Your Name Here
-Student ID: Your ID Here
-Email: Your Email Here
+Name: Keaton Boyle 
+Student ID: 103882791 
+Email: keatonboyle@gmail.com
 
 # Partner 2
 Name: Anthony Ortega

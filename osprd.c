@@ -17,6 +17,8 @@
 #include "spinlock.h"
 #include "osprd.h"
 
+#include <linux/slab.h>
+
 /* The size of an OSPRD sector. */
 #define SECTOR_SIZE	512
 
@@ -44,6 +46,12 @@ MODULE_AUTHOR("Keaton Boyle, Anthony Ortega");
 static int nsectors = 32;
 module_param(nsectors, int, 0);
 
+struct bad_ticket
+{
+  unsigned ticket_val;
+  struct bad_ticket *next;
+};
+
 
 /* The internal representation of our device. */
 typedef struct osprd_info {
@@ -65,8 +73,10 @@ typedef struct osprd_info {
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
   
-  int w_lock;
-  int r_locks;
+  int w_lock;                  //Count of write locks. 0 or 1
+  int r_locks;                 //Count of read locks
+  
+  struct bad_ticket *bad_head;
 
 	// The following elements are used internally; you don't need
 	// to understand them.
@@ -278,10 +288,12 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
 		// Your code here (instead of the next two lines).
 		
+    /*if((filp->f_flags & F_OSPRD_LOCKED) == F_OSPRD_LOCKED)
+      return -EDEADLK;*/
+		
 		osp_spin_lock(&d->mutex);
 		unsigned local_ticket = d->ticket_head++;
 		osp_spin_unlock(&d->mutex);
-    //eprintk("Ticket #%d for %d\n",local_ticket,filp_writable);
 		
 		switch(filp_writable)
     {
@@ -292,24 +304,52 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
           if(wait_event_interruptible(d->blockq,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)) == -ERESTARTSYS)
           {
-            //eprintk("Ticket #%d for %d got signal!\n",local_ticket,filp_writable);
-            //eprintk("Ticket #%d shall die!\n",local_ticket);
+            
             osp_spin_lock(&d->mutex);
             if(d->ticket_tail == local_ticket)
               d->ticket_tail++;
+            else
+            {
+             /*Add my ticket to list*/ 
+             struct bad_ticket *temp = d->bad_head;
+             struct bad_ticket *n = ((struct bad_ticket*)
+              kmalloc(sizeof(struct bad_ticket),GFP_ATOMIC));
+             n->ticket_val = local_ticket;
+             n->next = temp;
+             d->bad_head = n;
+            }
             osp_spin_unlock(&d->mutex);
             return -ERESTARTSYS;
           }
-          //eprintk("Ticket #%d is about to go to work(read) %d\n",local_ticket,filp_writable);
+          
           osp_spin_lock(&d->mutex);
           if(d->w_lock != 0)
           {
            osp_spin_unlock(&d->mutex);
-           //eprintk("Ticket #%d going back to sleep(read)\n",local_ticket);
            continue;
           }
           d->r_locks++;
           d->ticket_tail++;
+          
+          /*check if ticket_tail is on bad_ticket list*/
+          /*If it is, increment ticket_tail and remove that ticket*/
+          /*Then redo over again*/
+          struct bad_ticket *curr = d->bad_head;
+          struct bad_ticket **prev = &(d->bad_head);
+          while(curr)
+          {
+            if(curr->ticket_val == d->ticket_tail)
+            {
+              *prev = curr->next;
+              kfree(curr);
+              d->ticket_tail++;
+              curr = d->bad_head;
+              prev = &(d->bad_head);
+              continue;
+            }
+            prev = &(curr->next);
+            curr = curr->next;
+          }         
           osp_spin_unlock(&d->mutex);
           
           filp->f_flags |= F_OSPRD_LOCKED;
@@ -325,18 +365,52 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
           if(wait_event_interruptible(d->blockq,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)
               && (d->r_locks == 0)) == -ERESTARTSYS)
+          {
+            osp_spin_lock(&d->mutex);
+            if(d->ticket_tail == local_ticket)
+              d->ticket_tail++;
+            else
+            {
+              /*Add my ticket to list*/
+             struct bad_ticket *temp = d->bad_head;
+             struct bad_ticket *n = ((struct bad_ticket*)
+              kmalloc(sizeof(struct bad_ticket),GFP_ATOMIC));
+             n->ticket_val = local_ticket;
+             n->next = temp;
+             d->bad_head = n;             
+            }
+            osp_spin_unlock(&d->mutex);          
             return -ERESTARTSYS;
-          //eprintk("Ticket #%d is about to go to work(write) %d\n",local_ticket,filp_writable);
+          }
+          
           osp_spin_lock(&d->mutex);
           if((d->w_lock != 0) || (d->r_locks != 0))
           {
            osp_spin_unlock(&d->mutex);
-           //eprintk("Ticket #%d going back to sleep(write)\n",local_ticket);
            continue;
           }
 
           d->w_lock = 1;
           d->ticket_tail++;
+          
+          /*check if ticket_tail is on bad_ticket list*/
+          /*If it is, increment ticket_tail and remove that ticket from the list*/          
+          struct bad_ticket *curr = d->bad_head;
+          struct bad_ticket **prev = &(d->bad_head);
+          while(curr)
+          {
+            if(curr->ticket_val == d->ticket_tail)
+            {
+              *prev = curr->next;
+              kfree(curr);
+              d->ticket_tail++;
+              curr = d->bad_head;
+              prev = &(d->bad_head);
+              continue;
+            }
+            prev = &(curr->next);
+            curr = curr->next;
+          } 
           osp_spin_unlock(&d->mutex);
           
           filp->f_flags |= F_OSPRD_LOCKED;
@@ -358,6 +432,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Otherwise, if we can grant the lock request, return 0.
 
 		// Your code here (instead of the next two lines).
+		
+		/*if((filp->f_flags & F_OSPRD_LOCKED) == F_OSPRD_LOCKED)
+      return -EBUSY;*/
 		
     osp_spin_lock(&d->mutex);
     if(d->ticket_head != d->ticket_tail)
@@ -454,6 +531,7 @@ static void osprd_setup(osprd_info_t *d)
   
   d->w_lock = 0;
   d->r_locks = 0;
+  d->bad_head = 0;
 	/* Add code here if you add fields to osprd_info_t. */
 }
 

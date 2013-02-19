@@ -16,6 +16,7 @@
 
 #include "spinlock.h"
 #include "osprd.h"
+#include "eosprd.h"
 /*
 #include <unistd.h>
 #include <sys/types.h>
@@ -494,10 +495,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
         break;
       }
     }
-    /*eprintk("attempting to acquire\n");
-    r = -ENOTTY;*/
-
-  } else if (cmd == OSPRDIOCTRYACQUIRE) {
+  } 
+  else if (cmd == OSPRDIOCTRYACQUIRE) {
 
     // EXERCISE: ATTEMPT to lock the ramdisk.
     //
@@ -574,7 +573,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     /*eprintk("Attempting to try acquire\n");
     r = -ENOTTY;*/
 
-  } else if (cmd == OSPRDIOCRELEASE) {
+  } 
+  else if (cmd == OSPRDIOCRELEASE) {
 
     // EXERCISE: Unlock the ramdisk.
     //
@@ -619,7 +619,16 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     }
     //r -ENOTTY;
 
-  } else
+  } 
+  else if (cmd == EOSPRDIOCOPEN) {
+    eprintk("%s\n", (char *) arg);
+    r = 0;
+    
+
+    
+  }
+  else
+
     r = -ENOTTY; /* unknown command */
   return r;
 }

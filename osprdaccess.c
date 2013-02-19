@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "osprd.h"
+#include "eosprd.h"
 
 void usage(int status)
 {
@@ -207,7 +208,7 @@ int main(int argc, char *argv[])
 	}
 
 	// Open ramdisk file
-	devfd = open(devname, mode);
+	devfd = eosprd_open(devname, mode, "hello");
 	if (devfd == -1) {
 		perror("open");
 		exit(1);

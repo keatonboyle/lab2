@@ -62,7 +62,7 @@ struct pid_list
   struct pid_list *next;
 };
 
-
+static char *pass = "Keatonium";
 
 
 
@@ -252,6 +252,39 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 
   return 0;
 }
+
+/*static ssize_t osprd_my_read(struct file *filp, char __user *buf, size_t length, loff_t *offset)
+{
+  osprd_info_t *d = file2osprd(filp);
+  if(buf != 0)
+  {
+    memcpy((void *)(buf),
+       (const void *)(d->data + (filp->f_pos*SECTOR_SIZE)),
+        length);
+  }
+  else
+  {
+    eprintk("BUFFER IS NULL DURING READ!!\n");
+    return -1;
+  }
+  return length;
+}
+
+static ssize_t osprd_my_write(struct file *filp, const char __user *buf, size_t length, loff_t *offset)
+{
+  osprd_info_t *d = file2osprd(filp);
+  if(buf != 0)
+  {
+    memcpy((void *)(d->data + (filp->f_pos*SECTOR_SIZE)),
+       (const void*)(buf), length);    
+  }
+  else
+  {
+    eprintk("BUFFER IS NULL DURING READ!!\n");
+    return -1;   
+  }
+  return length;
+}*/
 
 
 /*
@@ -619,6 +652,30 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     }
     //r -ENOTTY;
 
+  } else if (cmd == OSPRDIOPASSWORD) {
+    
+    char __user *argp = (char __user *) arg;
+    int iter;
+    /*eprintk("The password given is ");
+    for(iter = 0; argp[iter] != '\0'; iter++)
+      eprintk("%c",argp[iter]);
+    eprintk("\n");*/
+    
+    int is_good = 1;
+    for(iter = 0; (argp[iter] != '\0') && (pass[iter] != '\0'); iter++)
+    {
+      if(argp[iter] != pass[iter])
+      {
+        is_good = 0;
+        break;
+      }
+    }
+    if(is_good == 1)
+      eprintk("You entered the right password!\n");
+    else
+      eprintk("HAHA wrong password!\n");
+    
+    
   } else
     r = -ENOTTY; /* unknown command */
   return r;

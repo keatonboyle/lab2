@@ -621,6 +621,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
   } 
   else if (cmd == EOSPRDIOCOPEN) {
+
+
+
     eprintk("%s\n", (char *) arg);
     r = 0;
     

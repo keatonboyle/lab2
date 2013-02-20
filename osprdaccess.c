@@ -137,6 +137,7 @@ int main(int argc, char *argv[])
 	double delay = 0;
 	double lock_delay = 0;
 	const char *devname = "/dev/osprda";
+  char *password = NULL;;
 
  flag:
 	// Detect a read/write option
@@ -201,6 +202,14 @@ int main(int argc, char *argv[])
 	if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0))
 		usage(0);
 
+
+  //Detect a password option
+  if (argc >= 2 && strcmp(argv[1], "-p") == 0) {
+    password = argv[2];
+    argv += 2, argc -= 2;
+    goto flag;
+  }
+
 	// Detect a device name
 	if (argc >= 2 && argv[1][1] != '-') {
 		devname = argv[1];
@@ -208,7 +217,7 @@ int main(int argc, char *argv[])
 	}
 
 	// Open ramdisk file
-	devfd = eosprd_open(devname, mode, "hello");
+	devfd = eosprd_open(devname, mode, password);
 	if (devfd == -1) {
 		perror("open");
 		exit(1);

@@ -91,8 +91,12 @@ typedef struct osprd_info {
   int r_locks;                 //Count of read locks
 
   struct pid_list *pids;
-  
+
   struct bad_ticket *bad_head;
+
+  int encrypted;
+  char *key;
+  char *algo;
 
   // The following elements are used internally; you don't need
   // to understand them.
@@ -620,19 +624,35 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     //r -ENOTTY;
 
   } 
-  else if (cmd == EOSPRDIOCOPEN) {
-
-
-
+  else if (cmd == EOSPRDIOCOPEN) 
+  {
+    
+    /* Testing stuff
     eprintk("%s\n", (char *) arg);
     r = 0;
-    
 
+    eprintk("%p\n", filp->f_security);
+
+    filp->f_security = kmalloc(8,GFP_ATOMIC);
+    *((char *) (filp->f_security)) = 'f';
+    *(((char *) (filp->f_security)) + 1) = 'o';
+    *(((char *) (filp->f_security)) + 2) = 'o';
+    *(((char *) (filp->f_security)) + 3) = 0;
+    */
+      
+
+  }
+
+  else if (cmd == EOSPRDIOCENCRYPT) {
+    /* Testing stuff
+    eprintk("%s", (char *) filp->f_security);
+    eprintk("Got here");
+    */
     
   }
   else
-
     r = -ENOTTY; /* unknown command */
+
   return r;
 }
 
@@ -653,6 +673,9 @@ static void osprd_setup(osprd_info_t *d)
   d->r_locks = 0;
   d->bad_head = 0;
   d->pids = 0;
+  d->encrypted = 0;
+  d->key = 0;
+  d->algo = 0;
   /* Add code here if you add fields to osprd_info_t. */
 }
 

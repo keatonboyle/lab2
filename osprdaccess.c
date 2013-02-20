@@ -219,9 +219,11 @@ int main(int argc, char *argv[])
 	// Open ramdisk file
 	devfd = eosprd_open(devname, mode, password);
 	if (devfd == -1) {
+    printf("open failed");
 		perror("open");
 		exit(1);
 	}
+  ioctl(devfd, EOSPRDIOCENCRYPT, NULL);
 
 	// Lock, possibly after delay
 	if (dolock || dotrylock) {

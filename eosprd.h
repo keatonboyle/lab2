@@ -4,6 +4,9 @@
 /*#include <linux/types.h>
 #include <linux/file.h>*/
 
+#define true 1
+#define false 0
+
 // new iotcl constants
 #define EOSPRDIOCOPEN 45
 #define EOSPRDIOCENCRYPT 46

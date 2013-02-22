@@ -63,8 +63,7 @@ struct pid_list
   struct pid_list *next;
 };
 
-
-
+static struct file_operations osprd_blk_fops;
 
 
 /* The internal representation of our device. */
@@ -132,7 +131,80 @@ static void for_each_open_file(struct task_struct *task,
             osprd_info_t *user_data),
              osprd_info_t *user_data);
 
+static int trykey(osprd_info_t *d, char *key)
+{
+  return true;
+}
 
+static char *decrypt_entire(osprd_info_t *d, char *key)
+{
+  char *tmpAlgo = d->algo;
+  
+  //TODO: Add actual decryption
+  
+  d->encrypted = false;
+  d->algo = 0;
+  return tmpAlgo;
+}
+
+static void encrypt_entire(osprd_info_t *d, char *key, char *algo)
+{
+  //TODO: Add actual encryption
+  
+  d->encrypted = true;
+  d->algo = algo;
+  return;
+}
+
+static ssize_t eosprd_read(struct file *filp, char __user *buf, size_t length, 
+    loff_t *offset)
+{
+  int numFailed;
+
+//  eprintk("Password reading!\n");
+  osprd_info_t *d = file2osprd(filp);
+
+  if(*offset >= nsectors*SECTOR_SIZE)
+    return 0;
+
+  if(buf != 0)
+  {
+    numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
+                             length);
+  }
+  else
+  {
+    return -EFAULT;
+  }
+  *offset += length;
+  return length - numFailed;
+}
+
+static ssize_t eosprd_write(struct file *filp, const char __user *buf, 
+    size_t length, loff_t *offset)
+{
+  int numFailed;
+  
+//  eprintk("Password writing!\n");
+  osprd_info_t *d = file2osprd(filp);
+
+  if(*offset >= nsectors*SECTOR_SIZE)
+    return 0;
+
+  if(buf != 0)
+  {
+    numFailed = copy_from_user((void *)(d->data + *offset), (const void*)(buf),
+                               length);
+  }
+  else
+  {
+    return -EFAULT;
+  }
+  *offset += length;
+  return length - numFailed;
+}
+
+#if 0
 /*
  * osprd_process_request(d, req)
  *   Called when the user reads or writes a sector.
@@ -140,6 +212,7 @@ static void for_each_open_file(struct task_struct *task,
  */
 static void osprd_process_request(osprd_info_t *d, struct request *req)
 {
+ 
   if (!blk_fs_request(req)) {
     end_request(req, 0);
     return;
@@ -158,8 +231,9 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 
   switch(rq_data_dir(req))
   {
-    case 0:  //Read
+    case 0:  // ---------------------------------------------------------- Read
     {
+      
       if(req->buffer != 0)
       {
         memcpy((void *)(req->buffer),
@@ -171,7 +245,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
       break;
     }
 
-    case 1:  //Write
+    case 1:  // --------------------------------------------------------- Write
     {
       if(req->buffer != 0)
       {
@@ -187,6 +261,7 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
   
   end_request(req, 1);
 }
+#endif
 
 
 // This function is called when a /dev/osprdX file is opened.
@@ -206,6 +281,7 @@ static int osprd_open(struct inode *inode, struct file *filp)
 static int osprd_close_last(struct inode *inode, struct file *filp)
 {
   if (filp) {
+    char *ci;
     osprd_info_t *d = file2osprd(filp);
     int filp_writable = filp->f_mode & FMODE_WRITE;
 
@@ -250,6 +326,20 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
        osp_spin_unlock(&d->mutex);
      wake_up_all(&d->blockq);
     }
+
+    // Zero out the key, for securty
+    /*
+    for (ci = filp->f_security; *ci != 0; ci++)
+    {
+      *ci = 0;
+    }
+    */
+    // Free the saved key that this file was using
+     /*
+    kfree(filp->f_security);
+    filp->f_security = NULL;
+    */
+
     // This line avoids compiler warnings; you may remove it.
     (void) filp_writable, (void) d;
 
@@ -324,6 +414,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       return -EDEADLK;*/
     
     struct pid_list *temppl;
+    struct pid_list *new;
+    unsigned local_ticket;
+
+
     osp_spin_lock(&d->mutex);
     temppl = d->pids;
     while(temppl)
@@ -336,29 +430,34 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       temppl = temppl->next;
     }
     temppl = d->pids;
-    struct pid_list *new = ((struct pid_list *)
-      kmalloc(sizeof(struct pid_list),GFP_ATOMIC));
+    new = ((struct pid_list *) kmalloc(sizeof(struct pid_list),GFP_ATOMIC));
     new->pid = current->pid;
     new->next = temppl;
     d->pids = new;
 
-    unsigned local_ticket = d->ticket_head++;
+    local_ticket = d->ticket_head++;
     osp_spin_unlock(&d->mutex);
     
     switch(filp_writable)
     {
       case 0:   // Opened for reading
       {
+        struct bad_ticket *currBad;
+        struct bad_ticket **prevBad;
         
         for(;;)
         {
           if(wait_event_interruptible(d->blockq,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)) == -ERESTARTSYS)
           {
+            struct pid_list *curr;
+            struct pid_list **prev;
+
             osp_spin_lock(&d->mutex);
 
-            struct pid_list *curr = d->pids;
-            struct pid_list **prev = &(d->pids);
+            curr = d->pids;
+            prev = &(d->pids);
+
             while(curr)
             {
               if(curr->pid == current->pid)
@@ -399,21 +498,21 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
           /*check if ticket_tail is on bad_ticket list*/
           /*If it is, increment ticket_tail and remove that ticket*/
           /*Then redo over again*/
-          struct bad_ticket *curr = d->bad_head;
-          struct bad_ticket **prev = &(d->bad_head);
-          while(curr)
+          currBad = d->bad_head;
+          prevBad = &(d->bad_head);
+          while(currBad)
           {
-            if(curr->ticket_val == d->ticket_tail)
+            if(currBad->ticket_val == d->ticket_tail)
             {
-              *prev = curr->next;
-              kfree(curr);
+              *prevBad = currBad->next;
+              kfree(currBad);
               d->ticket_tail++;
-              curr = d->bad_head;
-              prev = &(d->bad_head);
+              currBad = d->bad_head;
+              prevBad = &(d->bad_head);
               continue;
             }
-            prev = &(curr->next);
-            curr = curr->next;
+            prevBad = &(currBad->next);
+            currBad = currBad->next;
           }         
           osp_spin_unlock(&d->mutex);
           
@@ -431,10 +530,14 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)
               && (d->r_locks == 0)) == -ERESTARTSYS)
           {
+            struct pid_list *curr;
+            struct pid_list **prev;
+
             osp_spin_lock(&d->mutex);
 
-            struct pid_list *curr = d->pids;
-            struct pid_list **prev = &(d->pids);
+            curr = d->pids;
+            prev = &(d->pids);
+
             while(curr)
             {
               if(curr->pid == current->pid)
@@ -626,28 +729,94 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
   } 
   else if (cmd == EOSPRDIOCOPEN) 
   {
-    
-    /* Testing stuff
-    eprintk("%s\n", (char *) arg);
-    r = 0;
+    char *key = (char *) arg;
 
-    eprintk("%p\n", filp->f_security);
+    if (!key)
+    {
+      if (d->encrypted)
+      {
+        return -EKEYREJECTED;
+      }
+      else
+      {
+        // No decryption necessary
+        return 0;
+      }
+    }
+    else if (trykey(d, key))
+    {
+      char *ci = key;
+      int nChars = 0;
+      char *keycopy;
+      for ( ; *ci != 0; ci++)
+      {
+        nChars++;
+      }
 
-    filp->f_security = kmalloc(8,GFP_ATOMIC);
-    *((char *) (filp->f_security)) = 'f';
-    *(((char *) (filp->f_security)) + 1) = 'o';
-    *(((char *) (filp->f_security)) + 2) = 'o';
-    *(((char *) (filp->f_security)) + 3) = 0;
-    */
-      
+      // Save the key in kernel memory, give the file a pointer to it
+      keycopy = kmalloc(nChars+1, GFP_ATOMIC);
+      memcpy(keycopy, key, nChars+1);
 
+      filp->f_security = keycopy;
+
+      return 0;
+    }
+    else
+    {
+      return -EKEYREJECTED;
+    }
   }
 
-  else if (cmd == EOSPRDIOCENCRYPT) {
-    /* Testing stuff
-    eprintk("%s", (char *) filp->f_security);
-    eprintk("Got here");
-    */
+  else if (cmd == EOSPRDIOCENCRYPT)
+  {
+    struct encrypt_args *keys = (struct encrypt_args *) arg;
+    char *oldalgo = NULL;
+
+    // If encrypted, decrypt it
+    if (d->encrypted)
+    {
+      if (!(keys->oldkey))
+      {
+        return -EKEYREJECTED;
+      }
+      else if (!trykey(d, keys->oldkey))
+      {
+        return -EKEYREJECTED;
+      }
+      else 
+      {
+        oldalgo = decrypt_entire(d, keys->oldkey);
+      }
+    }
+    // If you provide a key to an already-decrypted file, that's a problem
+    else
+    {
+      // can't provide a key to an unencrypted file
+      if (keys->oldkey)
+      {
+        return -ENOSYS;
+      }
+    }
+
+    // If there's a new key, encrypt!
+    if (keys->newkey)
+    {
+      // If a new algorithm is provided, use it.  Otherwise, use the previous
+      //  one.  If there's a new nor an old algorithm, that's an error.
+      char *algo = oldalgo;
+      if (keys->algo)
+        algo = keys->algo;
+      if (!algo)
+      {
+        return -ENOSYS;
+      }
+        
+      encrypt_entire(d, keys->newkey, NULL);
+    }
+
+
+    // Success!
+    return 0;
     
   }
   else
@@ -685,6 +854,7 @@ static void osprd_setup(osprd_info_t *d)
 /*                                                                           */
 /*****************************************************************************/
 
+#if 0
 // Process a list of requests for a osprd_info_t.
 // Calls osprd_process_request for each element of the queue.
 
@@ -696,13 +866,13 @@ static void osprd_process_request_queue(request_queue_t *q)
   while ((req = elv_next_request(q)) != NULL)
     osprd_process_request(d, req);
 }
+#endif
 
 
 // Some particularly horrible stuff to get around some Linux issues:
 // the Linux block device interface doesn't let a block device find out
 // which file has been closed.  We need this information.
 
-static struct file_operations osprd_blk_fops;
 static int (*blkdev_release)(struct inode *, struct file *);
 
 static int _osprd_release(struct inode *inode, struct file *filp)
@@ -720,6 +890,12 @@ static int _osprd_open(struct inode *inode, struct file *filp)
     osprd_blk_fops.release = _osprd_release;
   }
   filp->f_op = &osprd_blk_fops;
+
+  /* adding custom reads and writes (for some reason it didn't work to have 
+   * these in the osprd_ops structure */
+  osprd_blk_fops.read = eosprd_read;
+  osprd_blk_fops.write = eosprd_write;
+
   return osprd_open(inode, filp);
 }
 
@@ -731,6 +907,7 @@ static struct block_device_operations osprd_ops = {
   .open = _osprd_open,
   // .release = osprd_release, // we must call our own release
   .ioctl = osprd_ioctl
+   
 };
 
 
@@ -786,8 +963,10 @@ static void cleanup_device(osprd_info_t *d)
     del_gendisk(d->gd);
     put_disk(d->gd);
   }
+  /*
   if (d->queue)
     blk_cleanup_queue(d->queue);
+  */
   if (d->data)
     vfree(d->data);
 }
@@ -804,12 +983,16 @@ static int setup_device(osprd_info_t *d, int which)
     return -1;
   memset(d->data, 0, nsectors * SECTOR_SIZE);
 
-  /* Set up the I/O queue. */
+  /* Instead of the optimized request_queue, we're using our own read/write
+   * functions
+
+   *  Set up the I/O queue. *
   spin_lock_init(&d->qlock);
   if (!(d->queue = blk_init_queue(osprd_process_request_queue, &d->qlock)))
     return -1;
   blk_queue_hardsect_size(d->queue, SECTOR_SIZE);
   d->queue->queuedata = d;
+  */
 
   /* The gendisk structure. */
   if (!(d->gd = alloc_disk(1)))
@@ -817,7 +1000,12 @@ static int setup_device(osprd_info_t *d, int which)
   d->gd->major = OSPRD_MAJOR;
   d->gd->first_minor = which;
   d->gd->fops = &osprd_ops;
+
+
+
+  /*
   d->gd->queue = d->queue;
+  */
   d->gd->private_data = d;
   snprintf(d->gd->disk_name, 32, "osprd%c", which + 'a');
   set_capacity(d->gd, nsectors);

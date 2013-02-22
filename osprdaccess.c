@@ -112,8 +112,12 @@ void transfer_zero(int fd2, ssize_t size)
 	char buf[BUFSIZ];
 	memset(buf, '\0', BUFSIZ);
 
+  if (size < 0) size = BUFSIZ;
+
 	while (size != 0) {
 		ssize_t w = write(fd2, buf, (size > 0 && size < BUFSIZ ? size : BUFSIZ));
+    printf("size was = %d\n", size);
+    printf("write returned w = %d\n", w);
 		if (w < 0 && (errno == EAGAIN || errno == EINTR))
 			continue;
 		else if (w < 0 && errno == ENOSPC) /* end of file */
@@ -223,7 +227,6 @@ int main(int argc, char *argv[])
 		perror("open");
 		exit(1);
 	}
-  ioctl(devfd, EOSPRDIOCENCRYPT, NULL);
 
 	// Lock, possibly after delay
 	if (dolock || dotrylock) {

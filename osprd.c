@@ -95,7 +95,9 @@ typedef struct osprd_info {
 
   int encrypted;
   char *key;
+  int keylen; 
   char *algo;
+  int algolen;
 
   // The following elements are used internally; you don't need
   // to understand them.
@@ -131,9 +133,46 @@ static void for_each_open_file(struct task_struct *task,
             osprd_info_t *user_data),
              osprd_info_t *user_data);
 
-static int trykey(osprd_info_t *d, char *key)
+
+static int trykey_k(osprd_info_t *d, char *key)
 {
-  return true;
+  char *ci = key;
+  char ch;
+  int numChars = 0;
+
+  while((ch = *ci))
+  {
+    if (numChars > d->keylen) return false;
+    if (ch != key[numChars]) return false;
+    ci++;
+    numChars++;
+  }
+
+  if (numChars == d->keylen) return true;
+
+  return false;
+}
+  
+
+static int trykey_user(osprd_info_t *d, char __user *key)
+// called during a re-encryption
+{
+  char *ci = key;
+  char ch;
+  int numChars = 0;
+
+  while(!get_user(ch,ci) && ch)
+  {
+    eprintk("User key char[%d]: %c\n", numChars, ch);
+    if (numChars > d->keylen) return false;
+    if (ch != key[numChars]) return false;
+    ci++;
+    numChars++;
+  }
+
+  if (numChars == d->keylen) return true;
+
+  return false;
 }
 
 static char *decrypt_entire(osprd_info_t *d, char *key)
@@ -143,17 +182,47 @@ static char *decrypt_entire(osprd_info_t *d, char *key)
   //TODO: Add actual decryption
   
   d->encrypted = false;
-  d->algo = 0;
   return tmpAlgo;
 }
 
-static void encrypt_entire(osprd_info_t *d, char *key, char *algo)
+static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
 {
+  int numChars = 0;
+  int ret;
   //TODO: Add actual encryption
   
+  // Find the length of the encryption key
+  // While we can get more characters, and those characters aren't NULL bytes
+  numChars = strnlen_user(key, 1024);
+
+  d->key = kmalloc(numChars, GFP_ATOMIC);
+  ret = copy_from_user(d->key, key, numChars);
+
+  eprintk("copy_from_user returned: %d\n", ret);
+
+  d->keylen = numChars;
+
+  if (algo)
+  {
+    numChars = strnlen_user(algo, 1024);
+    d->algo = kmalloc(numChars, GFP_ATOMIC);
+    ret = copy_from_user(d->algo, algo, numChars);
+    d->algolen = numChars;
+  }
+  else
+  {
+    // if the user didn't provide an algoritm, we'd better have a previously used
+    //  one
+    if (!d->algo)
+    {
+      return -ENOSYS;
+    }
+  }
+
   d->encrypted = true;
-  d->algo = algo;
-  return;
+  eprintk("New algo: %s", d->algo);
+  
+  return 0;
 }
 
 static ssize_t eosprd_read(struct file *filp, char __user *buf, size_t length, 
@@ -161,47 +230,77 @@ static ssize_t eosprd_read(struct file *filp, char __user *buf, size_t length,
 {
   int numFailed;
 
-//  eprintk("Password reading!\n");
   osprd_info_t *d = file2osprd(filp);
 
+  if(buf == 0) return -EFAULT;
+
+  if (d->encrypted) // ----------------------------------------- ENCRYPTED READ
+  {
+    if(trykey_k(d, filp->f_security))
+    {
+      if(*offset >= nsectors*SECTOR_SIZE)
+        return 0;
+
+      numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
+                               length);
+
+      *offset += (length - numFailed);
+      return length - numFailed;
+    }
+  }
+  // -------------------------------------------------------------- NORMAL READ
   if(*offset >= nsectors*SECTOR_SIZE)
     return 0;
 
-  if(buf != 0)
-  {
-    numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
-                             length);
-  }
-  else
-  {
-    return -EFAULT;
-  }
-  *offset += length;
+  numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
+                           length);
+
+  *offset += (length - numFailed);
   return length - numFailed;
+
 }
+
 
 static ssize_t eosprd_write(struct file *filp, const char __user *buf, 
     size_t length, loff_t *offset)
 {
   int numFailed;
   
-//  eprintk("Password writing!\n");
   osprd_info_t *d = file2osprd(filp);
 
-  if(*offset >= nsectors*SECTOR_SIZE)
-    return 0;
+  if(buf == 0) return -EFAULT;
 
-  if(buf != 0)
+  if (d->encrypted) // --------------------------------------- ENCRYPTED WRITE
   {
-    numFailed = copy_from_user((void *)(d->data + *offset), (const void*)(buf),
-                               length);
+    if(trykey_k(d, filp->f_security))
+    {
+      if(*offset >= nsectors*SECTOR_SIZE)
+        return 0;
+
+      numFailed = copy_from_user((void *)(d->data + *offset), 
+                                 (const void*)(buf), length);
+
+      *offset += (length - numFailed);
+      return length - numFailed;
+    }
+    else
+    {
+      return -EKEYREJECTED;
+    }
   }
-  else
+  else // ------------------------------------------------------- NORMAL WRITE
   {
-    return -EFAULT;
+    if(*offset >= nsectors*SECTOR_SIZE)
+      return 0;
+
+    if(buf != 0)
+    {
+      numFailed = copy_from_user((void *)(d->data + *offset), 
+                                 (const void*)(buf), length);
+    }
+    *offset += length;
+    return length - numFailed;
   }
-  *offset += length;
-  return length - numFailed;
 }
 
 #if 0
@@ -327,18 +426,19 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
      wake_up_all(&d->blockq);
     }
 
-    // Zero out the key, for securty
-    /*
-    for (ci = filp->f_security; *ci != 0; ci++)
+    if (filp->f_security)
     {
-      *ci = 0;
+      // Zero out the key, for securty
+      for (ci = filp->f_security; *ci != 0; ci++)
+      {
+        *ci = 0;
+      }
+      // Free the saved key that this file was using
+      kfree(filp->f_security);
+      filp->f_security = NULL;
     }
-    */
-    // Free the saved key that this file was using
-     /*
-    kfree(filp->f_security);
-    filp->f_security = NULL;
-    */
+
+
 
     // This line avoids compiler warnings; you may remove it.
     (void) filp_writable, (void) d;
@@ -618,6 +718,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       return -EBUSY;*/
     
     struct pid_list *temppl;
+    struct pid_list *new;
     osp_spin_lock(&d->mutex);
     temppl = d->pids;
     while(temppl)
@@ -630,8 +731,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       temppl = temppl->next;
     }
     temppl = d->pids;
-    struct pid_list *new = ((struct pid_list *)
-      kmalloc(sizeof(struct pid_list),GFP_ATOMIC));
+    new = ((struct pid_list *) kmalloc(sizeof(struct pid_list),GFP_ATOMIC));
     new->pid = current->pid;
     new->next = temppl;
     d->pids = new;
@@ -696,6 +796,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       r = -EINVAL;
     else
     {
+      struct pid_list *curr;
+      struct pid_list **prev;
+
      filp->f_flags ^= F_OSPRD_LOCKED;
      if(filp_writable == 0)
      {
@@ -708,8 +811,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
        d->w_lock = 0;
        //eprintk("I released my write lock!\n");
      }
-      struct pid_list *curr = d->pids;
-      struct pid_list **prev = &(d->pids);
+      curr = d->pids;
+      prev = &(d->pids);
       while(curr)
       {
         if(curr->pid == current->pid)
@@ -743,11 +846,12 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
         return 0;
       }
     }
-    else if (trykey(d, key))
+    else if (trykey_user(d, key))
     {
       char *ci = key;
       int nChars = 0;
       char *keycopy;
+      eprintk("user key accepted");
       for ( ; *ci != 0; ci++)
       {
         nChars++;
@@ -770,7 +874,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
   else if (cmd == EOSPRDIOCENCRYPT)
   {
     struct encrypt_args *keys = (struct encrypt_args *) arg;
-    char *oldalgo = NULL;
 
     // If encrypted, decrypt it
     if (d->encrypted)
@@ -779,13 +882,13 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       {
         return -EKEYREJECTED;
       }
-      else if (!trykey(d, keys->oldkey))
+      else if (!trykey_user(d, keys->oldkey))
       {
         return -EKEYREJECTED;
       }
       else 
       {
-        oldalgo = decrypt_entire(d, keys->oldkey);
+        decrypt_entire(d, keys->oldkey);
       }
     }
     // If you provide a key to an already-decrypted file, that's a problem
@@ -801,21 +904,11 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     // If there's a new key, encrypt!
     if (keys->newkey)
     {
-      // If a new algorithm is provided, use it.  Otherwise, use the previous
-      //  one.  If there's a new nor an old algorithm, that's an error.
-      char *algo = oldalgo;
-      if (keys->algo)
-        algo = keys->algo;
-      if (!algo)
-      {
-        return -ENOSYS;
-      }
-        
-      encrypt_entire(d, keys->newkey, NULL);
+      return encrypt_entire(d, keys->newkey, keys->algo);
     }
 
 
-    // Success!
+    // Or leave unencrypted
     return 0;
     
   }
@@ -844,7 +937,9 @@ static void osprd_setup(osprd_info_t *d)
   d->pids = 0;
   d->encrypted = 0;
   d->key = 0;
+  d->keylen = 0;
   d->algo = 0;
+  d->algolen= 0;
   /* Add code here if you add fields to osprd_info_t. */
 }
 

@@ -41,7 +41,7 @@ struct encrypt_args
   char *algo;
 };
 
-static int eopsrd_encrypt(const char *pathname, char *oldkey, 
+static int eosprd_encrypt(const char *pathname, char *oldkey, 
     char *newkey, char *algo)
 {
   int ret;

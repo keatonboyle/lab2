@@ -13,6 +13,8 @@
 #include <linux/blkdev.h>
 #include <linux/wait.h>
 #include <linux/file.h>
+#include <linux/crypto.h>
+#include <linux/scatterlist.h>
 
 #include "spinlock.h"
 #include "osprd.h"
@@ -65,6 +67,8 @@ struct pid_list
 
 static struct file_operations osprd_blk_fops;
 
+static const char *sillycrypt_name = "sillycrypt";
+
 
 /* The internal representation of our device. */
 typedef struct osprd_info {
@@ -95,7 +99,7 @@ typedef struct osprd_info {
 
   int encrypted;
   char *key;
-  int keylen; 
+  int keylen;   // does not include null byte
   char *algo;
   int algolen;
 
@@ -133,13 +137,77 @@ static void for_each_open_file(struct task_struct *task,
             osprd_info_t *user_data),
              osprd_info_t *user_data);
 
+static int modulo(int left, int right)
+{
+  int tmp = left/right;
+
+  return (left - (right * tmp));
+}
+
+
+static void silly_encrypt(uint8_t *buf, int nbytes, char *key, int keylen, 
+    int keyoffset)
+{
+  int bi = 0;
+  int ki = keyoffset;
+
+  for (bi = 0; bi < nbytes; bi++)
+  {
+    buf[bi] = (buf[bi]) ^ ((uint8_t) key[ki]);
+    ki = modulo((ki+1), keylen);
+  }
+}
+
+static void silly_decrypt(uint8_t *buf, int nbytes, char *key, int keylen, 
+    int keyoffset)
+{
+  silly_encrypt(buf, nbytes, key, keylen, keyoffset);
+}
+
+  
 
 static int trykey_k(osprd_info_t *d, char *key)
 {
   char *ci = key;
   char ch;
   int numChars = 0;
+  int ret;
 
+  int testkeylen = strnlen(key, 1024);
+/*
+  eprintk("testkeylen= %d\n", testkeylen);
+  
+  eprintk("d->keylen= %d\n", d->keylen);*/
+  if (testkeylen != d->keylen)
+    return false;
+
+
+  /*
+  eprintk("d: 0x%08x\n", (int *) d->key);
+  eprintk("k: 0x%08x\n", (int *) key);
+  */
+
+  silly_decrypt(d->key, d->keylen, key, d->keylen, 0);
+
+  /*
+  eprintk("d: 0x%08x\n", (int *) d->key);
+  eprintk("k: 0x%08x\n", (int *) key);
+  */
+
+  if ((ret=memcmp(d->key, key, d->keylen)) == 0)
+  {
+//    eprintk("ret= %d\n", ret);
+
+    silly_encrypt(d->key, d->keylen, key, d->keylen, 0);
+    /*
+    eprintk("d: 0x%08x\n", (int *) d->key);
+    eprintk("k: 0x%08x\n", (int *) key);
+    */
+    return true;
+  }
+  return false;
+
+  /* plaintext comparison
   while((ch = *ci))
   {
     if (numChars > d->keylen) return false;
@@ -151,39 +219,90 @@ static int trykey_k(osprd_info_t *d, char *key)
   if (numChars == d->keylen) return true;
 
   return false;
+  */
 }
-  
+
 
 static int trykey_user(osprd_info_t *d, char __user *key)
-// called during a re-encryption
+// called during a re-encryption/opening
 {
   char *ci = key;
   char ch;
+  char *userkey_in_k;
   int numChars = 0;
+  int userkeylen = strnlen_user(key, 1024) - 1;
 
+  if (userkeylen != d->keylen)
+    return false;
+
+  
+  userkey_in_k = kmalloc(userkeylen, GFP_ATOMIC);
+
+
+  silly_decrypt(d->key, d->keylen, userkey_in_k, d->keylen, 0);
+
+  if (memcmp(d->key, userkey_in_k, d->keylen) == 0)
+  {
+    silly_encrypt(d->key, d->keylen, userkey_in_k, d->keylen, 0);
+    return true;
+  }
+  return false;
+
+  /* Plaintext comparison
   while(!get_user(ch,ci) && ch)
   {
     eprintk("User key char[%d]: %c\n", numChars, ch);
     if (numChars > d->keylen) return false;
-    if (ch != key[numChars]) return false;
+    if (ch != d->key[numChars]) return false;
+ 
     ci++;
     numChars++;
   }
 
+
+
+  eprintk("Got here: %d == %d\n", numChars, d->keylen);
   if (numChars == d->keylen) return true;
 
   return false;
+  */
 }
 
-static char *decrypt_entire(osprd_info_t *d, char *key)
+
+
+static int decrypt_entire(osprd_info_t *d, char __user *key)
 {
-  char *tmpAlgo = d->algo;
-  
+  int numChars;
+  char *userkey;
+  int ret;
   //TODO: Add actual decryption
-  
+
+  if (trykey_user(d, key))
+  {
+    numChars = strnlen_user(key, 1024) - 1;
+
+    userkey = kmalloc(numChars, GFP_ATOMIC);
+
+    ret = copy_from_user(userkey, key, numChars);
+
+    if (strcmp(d->algo, sillycrypt_name) == 0)
+    {
+      eprintk("Sillydecrypting!\n");
+      silly_decrypt(d->data, SECTOR_SIZE*nsectors, userkey, d->keylen, 0);
+    }
+    else
+      return -ENOSYS;
+  }
+  else
+  {
+    return -EKEYREJECTED;
+  }
+
+
   d->encrypted = false;
-  return tmpAlgo;
+  return 0;
 }
+  
 
 static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
 {
@@ -191,20 +310,28 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
   int ret;
   //TODO: Add actual encryption
   
+  // ------------------------------------------------------------- SET THINGS UP
   // Find the length of the encryption key
   // While we can get more characters, and those characters aren't NULL bytes
-  numChars = strnlen_user(key, 1024);
+  numChars = strnlen_user(key, 1024) - 1;
 
   d->key = kmalloc(numChars, GFP_ATOMIC);
+
   ret = copy_from_user(d->key, key, numChars);
 
+  
+
+  /*
   eprintk("copy_from_user returned: %d\n", ret);
+  eprintk("d->key has |%s|\n", d->key);
+  eprintk("numchars is %d\n", numChars);
+  */
 
   d->keylen = numChars;
 
   if (algo)
   {
-    numChars = strnlen_user(algo, 1024);
+    numChars = strnlen_user(algo, 1024) - 1;
     d->algo = kmalloc(numChars, GFP_ATOMIC);
     ret = copy_from_user(d->algo, algo, numChars);
     d->algolen = numChars;
@@ -219,8 +346,60 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
     }
   }
 
+  // ---------------------------------------------------------------- ENCRYPTION
+  /*  CONFUSION
+  struct scatterlist sg[2];
+  char output[SECTOR_SIZE];
+  struct crypto_tfm *transform;
+  
+  struct cipher_desc *description;
+  
+  
+
+  transform = crypto_alloc_tfm("ecb", 0);
+  if (IS_ERR(transform))
+  {
+    eprintk("Transform error\n");
+  }
+
+  description.desc = transform;
+  description.flags = 0;
+
+  ret = crypto_cipher_setkey(transform, "pass", 4);
+
+  if (ret)
+  {
+    eprintk("setkey error\n");
+  }
+
+  eprintk("Page size: %d\n", PAGE_SIZE);
+
+  sg_init_table(sg, 1);
+
+  sg_set_buf(sg, d->data, 512); 
+
+  ret = crypto_cipher_encrypt(transform, sg+1, sg, 512);
+  */
+
+  if (strcmp(d->algo, sillycrypt_name) == 0)
+  {
+    /*
+    eprintk("Sillycrypting!\n");
+    */
+    silly_encrypt(d->data, SECTOR_SIZE*nsectors, d->key, d->keylen, 0);
+  }
+  else
+    return -ENOSYS;
+
+  silly_encrypt(d->key, d->keylen, d->key, d->keylen, 0);
+
   d->encrypted = true;
-  eprintk("New algo: %s", d->algo);
+/*
+  eprintk("keylen is: %d\n", d->keylen);
+
+
+  eprintk("New algo: %s\n", d->algo);
+  */
   
   return 0;
 }
@@ -236,13 +415,31 @@ static ssize_t eosprd_read(struct file *filp, char __user *buf, size_t length,
 
   if (d->encrypted) // ----------------------------------------- ENCRYPTED READ
   {
-    if(trykey_k(d, filp->f_security))
+    /*
+    eprintk("here!\n");
+    eprintk("%s\n", (char *) filp->f_security);
+    */
+    if(filp->f_security && trykey_k(d, filp->f_security))
     {
+      /*
+      eprintk("and here!\n");
+      */
       if(*offset >= nsectors*SECTOR_SIZE)
         return 0;
 
+//      eprintk("Pre decrypt %02x\n", *(d->data + *offset));
+      silly_decrypt(d->data + *offset, length, filp->f_security, d->keylen,
+                    modulo((*offset),d->keylen));
+
+//      eprintk("After decrypt %02x\n", *(d->data + *offset));
+
       numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
                                length);
+
+      silly_encrypt(d->data + *offset, length, filp->f_security, d->keylen,
+                    modulo((*offset),d->keylen));
+
+//      eprintk("Re decrypt %02x\n", *(d->data + *offset));
 
       *offset += (length - numFailed);
       return length - numFailed;
@@ -272,13 +469,16 @@ static ssize_t eosprd_write(struct file *filp, const char __user *buf,
 
   if (d->encrypted) // --------------------------------------- ENCRYPTED WRITE
   {
-    if(trykey_k(d, filp->f_security))
+    if(filp->f_security && trykey_k(d, filp->f_security))
     {
       if(*offset >= nsectors*SECTOR_SIZE)
         return 0;
 
       numFailed = copy_from_user((void *)(d->data + *offset), 
                                  (const void*)(buf), length);
+
+      silly_encrypt(d->data + *offset, length, filp->f_security, d->keylen,
+                    modulo((*offset),d->keylen));
 
       *offset += (length - numFailed);
       return length - numFailed;
@@ -851,7 +1051,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       char *ci = key;
       int nChars = 0;
       char *keycopy;
-      eprintk("user key accepted");
+      //eprintk("user key accepted");
       for ( ; *ci != 0; ci++)
       {
         nChars++;

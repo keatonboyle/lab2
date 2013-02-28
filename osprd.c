@@ -245,13 +245,19 @@ static int trykey_k(osprd_info_t *d, char *key)
   key_decryption_output = kmalloc(d->keylen, GFP_ATOMIC);
 
   d->eprof.decrypt_key(key_decryption_output, d->key, key, d->keylen);
+  eprintk("k: keylen: %d\n", d->keylen);
+  eprintk("k: d->key: %016lx\n", *((unsigned long *) d->key));
+  eprintk("k: key_output: %016lx\n", *((unsigned long *) key_decryption_output));
+  eprintk("k: key: %016lx\n", *((unsigned long *) key));
 
   if (memcmp(key_decryption_output, key, d->keylen) == 0)
   {
+    eprintk("correct\n");
     r = true;
   }
   else
   {
+    eprintk("false\n");
     r = false;
   }
 
@@ -279,14 +285,28 @@ static int trykey_user(osprd_info_t *d, char __user *key)
   }
   key_decryption_output = kmalloc(d->keylen, GFP_ATOMIC);
 
+  eprintk("pre:\n");
+  eprintk("user: keylen: %d\n", d->keylen);
+  eprintk("user: key: %016lx\n", *((unsigned long *) d->key));
+  eprintk("user: key_output: %016lx\n", *((unsigned long *) key_decryption_output));
+  eprintk("user: user_key: %016lx\n", *((unsigned long *) userkey_in_k));
+
   d->eprof.decrypt_key(key_decryption_output, d->key, userkey_in_k, d->keylen);
+
+  eprintk("post:\n");
+  eprintk("user: keylen: %d\n", d->keylen);
+  eprintk("user: key: %016lx\n", *((unsigned long *) d->key));
+  eprintk("user: key_output: %016lx\n", *((unsigned long *) key_decryption_output));
+  eprintk("user: user_key: %016lx\n", *((unsigned long *) userkey_in_k));
 
   if (memcmp(key_decryption_output, userkey_in_k, d->keylen) == 0)
   {
+    eprintk("correct\n");
     r = true;
   }
   else
   {
+    eprintk("false\n");
     r = false;
   }
 
@@ -444,9 +464,9 @@ static ssize_t eosprd_read(struct file *filp, char __user *buf, size_t length,
           if (length <= 0) break;
         }
       }
+      return totalRead;
     }
 
-    return totalRead;
   }
 
   // -------------------------------------------------------------- NORMAL READ
@@ -639,13 +659,13 @@ static int osprd_open(struct inode *inode, struct file *filp)
 {
   // Always set the O_SYNC flag. That way, we will get writes immediately
   // instead of waiting for them to get through write-back caches.
-  filp->f_flags |= O_SYNC;
   osprd_info_t *d = file2osprd(filp);
+  filp->f_flags |= O_SYNC;
 
   osp_spin_lock(&d->mutex);
   d->enumopen++;
   osp_spin_unlock(&d->mutex);
-  
+
   return 0;
 }
 
@@ -659,6 +679,8 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
     char *ci;
     osprd_info_t *d = file2osprd(filp);
     int filp_writable = filp->f_mode & FMODE_WRITE;
+    struct pid_list *curr = d->pids;
+    struct pid_list **prev = &(d->pids);
 
     // EXERCISE: If the user closes a ramdisk file that holds
     // a lock, release the lock.  Also wake up blocked processes
@@ -684,8 +706,8 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
        osp_spin_lock(&d->mutex);
        d->w_lock = 0;
      }
-      struct pid_list *curr = d->pids;
-      struct pid_list **prev = &(d->pids);
+      curr = d->pids;
+      prev = &(d->pids);
       while(curr)
       {
         if(curr->pid == current->pid)
@@ -901,6 +923,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
       {
         for(;;)
         {
+          struct bad_ticket *badcurr = d->bad_head;
+          struct bad_ticket **badprev = &(d->bad_head);
           if(wait_event_interruptible(d->blockq,
             (d->ticket_tail == local_ticket) && (d->w_lock == 0)
               && (d->r_locks == 0)) == -ERESTARTSYS)
@@ -953,21 +977,21 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
           
           /*check if ticket_tail is on bad_ticket list*/
           /*if it is, increment ticket_tail and remove that ticket from the list*/          
-          struct bad_ticket *curr = d->bad_head;
-          struct bad_ticket **prev = &(d->bad_head);
-          while(curr)
+          badcurr = d->bad_head;
+          badprev = &(d->bad_head);
+          while(badcurr)
           {
-            if(curr->ticket_val == d->ticket_tail)
+            if(badcurr->ticket_val == d->ticket_tail)
             {
-              *prev = curr->next;
-              kfree(curr);
+              *badprev = badcurr->next;
+              kfree(badcurr);
               d->ticket_tail++;
-              curr = d->bad_head;
-              prev = &(d->bad_head);
+              badcurr = d->bad_head;
+              badprev = &(d->bad_head);
               continue;
             }
-            prev = &(curr->next);
-            curr = curr->next;
+            badprev = &(badcurr->next);
+            badcurr = badcurr->next;
           } 
           osp_spin_unlock(&d->mutex);
           
@@ -1123,7 +1147,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     }
     else if (trykey_user(d, key))
     {
-      char *ci = key;
       int nChars = strnlen_user(key, 1024);
       char *keycopy;
 

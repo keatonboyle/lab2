@@ -30,6 +30,11 @@ Usage: ./osprdaccess -w [SIZE] [OPTIONS] [DEVICE...] < DATA\n\
        -l would block, -L will return a \"resource busy\" error instead.\n\
    -d DELAY\n\
        Wait DELAY seconds before reading/writing (but after locking).\n\
+   -p PASSWORD\n\
+       Perform the operation on an encrypted ramdisk using the decryption\n\
+       key PASSWORD.\n\
+   -R\n\
+       Read raw (encrypted garbage) data from an encrypted ramdisk.\n\
    DEVICE is the device to read/write.  The default is /dev/osprda.\n\
    You can also give more than one device name.  All devices are opened, but\n\
    only the last device is read or written.\n");

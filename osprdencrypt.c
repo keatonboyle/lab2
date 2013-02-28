@@ -17,7 +17,11 @@ int main(int nargs, char **argv)
   int ret;
   if (nargs != 5) 
   {
-    printf("Need 5 args.");
+    fprintf(stderr, "\
+Usage: ./osprdencrypt RAMDISK_PATH CURRENT_KEY NEW_KEY ALGORITHM\n\
+    This program calls:\n\
+    eosprd_encrypt(RAMDISK_PATH, CURRENT_KEY, NEW_KEY, ALGORITHM)\n\
+    Enter a period ('.') to pass NULL as an argument to eopsrd_encrypt\n");
     exit(1);
   }
 
@@ -30,7 +34,14 @@ int main(int nargs, char **argv)
   }
 
   ret = eosprd_encrypt(argv[1], argv[2], argv[3], argv[4]);
-  printf("encryption returned: %d\n", ret);
-
-  return 0;
+  if (ret == 0)
+  {
+    printf("Successfully encrypted/decrypted %s\n", argv[1]);
+    exit(0);
+  }
+  else
+  {
+    printf("Encryption/decryption error\n", argv[1]);
+    exit(1);
+  }
 }

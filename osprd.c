@@ -65,6 +65,17 @@ struct pid_list
   struct pid_list *next;
 };
 
+struct encryption_profile
+{
+  void (*encrypt_sector) (uint8_t *dst_disk, uint8_t *src, char *key, 
+                          int keylen, unsigned long sectorNum);
+  void (*decrypt_sector) (uint8_t *dst, uint8_t *src_disk, char *key, 
+                          int keylen, unsigned long sectorNum);
+  void (*encrypt_key) (uint8_t *dst, uint8_t *src, char *key, int keylen);
+  void (*decrypt_key) (uint8_t *dst, uint8_t *src, char *key, int keylen);
+};
+
+
 static struct file_operations osprd_blk_fops;
 
 static const char *sillycrypt_name = "sillycrypt";
@@ -102,6 +113,10 @@ typedef struct osprd_info {
   int keylen;   // does not include null byte
   char *algo;
   int algolen;
+  struct encryption_profile eprof;
+
+  int enumopen; // num processes currently reading, writing, or de/encrypting
+                  // an encrypted ramdisk
 
   // The following elements are used internally; you don't need
   // to understand them.
@@ -137,6 +152,8 @@ static void for_each_open_file(struct task_struct *task,
             osprd_info_t *user_data),
              osprd_info_t *user_data);
 
+static void osprd_exit(void);
+
 static int modulo(int left, int right)
 {
   int tmp = left/right;
@@ -144,128 +161,140 @@ static int modulo(int left, int right)
   return (left - (right * tmp));
 }
 
-
-static void silly_encrypt(uint8_t *buf, int nbytes, char *key, int keylen, 
-    int keyoffset)
+static void osprd_read_sector(uint8_t *dst, uint8_t *src_disk, 
+                              unsigned long sectorNum)
 {
-  int bi = 0;
-  int ki = keyoffset;
+  memcpy(dst, src_disk + sectorNum*SECTOR_SIZE, SECTOR_SIZE);
+}
 
-  for (bi = 0; bi < nbytes; bi++)
+static void osprd_write_sector(uint8_t *dst_disk, uint8_t *src, 
+                              unsigned long sectorNum)
+{
+  memcpy(dst_disk + sectorNum*SECTOR_SIZE, src, SECTOR_SIZE);
+}
+
+/*  START SILLYCRYPTING STUFF *************************************************/
+
+static void silly_encrypt(uint8_t *dst, uint8_t *src, char *key, 
+    int keylen, size_t datalen)
+{
+  uint8_t *di = dst;
+  uint8_t *si = src;
+  int ki = 0;
+
+  for ( ; di < dst + datalen; di++, si++)
   {
-    buf[bi] = (buf[bi]) ^ ((uint8_t) key[ki]);
+    *di = (*si) ^ ((uint8_t) key[ki]);
     ki = modulo((ki+1), keylen);
   }
 }
 
-static void silly_decrypt(uint8_t *buf, int nbytes, char *key, int keylen, 
-    int keyoffset)
+static void silly_decrypt(uint8_t *dst, uint8_t *src, char *key, 
+    int keylen, size_t datalen)
 {
-  silly_encrypt(buf, nbytes, key, keylen, keyoffset);
+  silly_encrypt(dst, src, key, keylen, datalen);
 }
+
+static void silly_encrypt_sector(uint8_t *dst_disk, uint8_t *src, char *key, 
+    int keylen, unsigned long sectorNum)
+{
+  silly_encrypt(dst_disk+SECTOR_SIZE*sectorNum, src, key, keylen, SECTOR_SIZE);
+}
+
+static void silly_decrypt_sector(uint8_t *dst, uint8_t *src_disk, char *key, 
+    int keylen, unsigned long sectorNum)
+{
+  silly_decrypt(dst, src_disk+SECTOR_SIZE*sectorNum, key, keylen, SECTOR_SIZE);
+}
+
+static void silly_encrypt_key(uint8_t *dst, uint8_t *src, char *key, 
+    int keylen)
+{
+  silly_encrypt(dst, src, key, keylen, keylen);
+}
+
+static void silly_decrypt_key(uint8_t *dst, uint8_t *src, char *key, 
+    int keylen)
+{
+  silly_decrypt(dst, src, key, keylen, keylen);
+}
+
+static struct encryption_profile silly_profile = {
+  .encrypt_sector = silly_encrypt_sector,
+  .decrypt_sector = silly_decrypt_sector,
+  .encrypt_key = silly_encrypt_key,
+  .decrypt_key = silly_decrypt_key
+};
+
+
+/*  END SILLYCRYPTING STUFF ***************************************************/
 
   
 
 static int trykey_k(osprd_info_t *d, char *key)
 {
-  char *ci = key;
-  char ch;
-  int numChars = 0;
-  int ret;
+  // key is from f_security member, but points to kernelspace
+  int r;
+  char *key_decryption_output;
 
   int testkeylen = strnlen(key, 1024);
-/*
-  eprintk("testkeylen= %d\n", testkeylen);
-  
-  eprintk("d->keylen= %d\n", d->keylen);*/
+
   if (testkeylen != d->keylen)
     return false;
 
+  key_decryption_output = kmalloc(d->keylen, GFP_ATOMIC);
 
-  /*
-  eprintk("d: 0x%08x\n", (int *) d->key);
-  eprintk("k: 0x%08x\n", (int *) key);
-  */
+  d->eprof.decrypt_key(key_decryption_output, d->key, key, d->keylen);
 
-  silly_decrypt(d->key, d->keylen, key, d->keylen, 0);
-
-  /*
-  eprintk("d: 0x%08x\n", (int *) d->key);
-  eprintk("k: 0x%08x\n", (int *) key);
-  */
-
-  if ((ret=memcmp(d->key, key, d->keylen)) == 0)
+  if (memcmp(key_decryption_output, key, d->keylen) == 0)
   {
-//    eprintk("ret= %d\n", ret);
-
-    silly_encrypt(d->key, d->keylen, key, d->keylen, 0);
-    /*
-    eprintk("d: 0x%08x\n", (int *) d->key);
-    eprintk("k: 0x%08x\n", (int *) key);
-    */
-    return true;
+    r = true;
   }
-  return false;
-
-  /* plaintext comparison
-  while((ch = *ci))
+  else
   {
-    if (numChars > d->keylen) return false;
-    if (ch != key[numChars]) return false;
-    ci++;
-    numChars++;
+    r = false;
   }
 
-  if (numChars == d->keylen) return true;
-
-  return false;
-  */
+  memset(key_decryption_output, 0, d->keylen);
+  kfree(key_decryption_output);
+  return r;
 }
 
 
 static int trykey_user(osprd_info_t *d, char __user *key)
 // called during a re-encryption/opening
 {
-  char *ci = key;
-  char ch;
+  int r;
   char *userkey_in_k;
-  int numChars = 0;
+  char *key_decryption_output;
   int userkeylen = strnlen_user(key, 1024) - 1;
 
   if (userkeylen != d->keylen)
     return false;
 
-  
   userkey_in_k = kmalloc(userkeylen, GFP_ATOMIC);
-
-
-  silly_decrypt(d->key, d->keylen, userkey_in_k, d->keylen, 0);
-
-  if (memcmp(d->key, userkey_in_k, d->keylen) == 0)
+  if (copy_from_user(userkey_in_k, key, userkeylen))
   {
-    silly_encrypt(d->key, d->keylen, userkey_in_k, d->keylen, 0);
-    return true;
+    osprd_exit();
   }
-  return false;
+  key_decryption_output = kmalloc(d->keylen, GFP_ATOMIC);
 
-  /* Plaintext comparison
-  while(!get_user(ch,ci) && ch)
+  d->eprof.decrypt_key(key_decryption_output, d->key, userkey_in_k, d->keylen);
+
+  if (memcmp(key_decryption_output, userkey_in_k, d->keylen) == 0)
   {
-    eprintk("User key char[%d]: %c\n", numChars, ch);
-    if (numChars > d->keylen) return false;
-    if (ch != d->key[numChars]) return false;
- 
-    ci++;
-    numChars++;
+    r = true;
+  }
+  else
+  {
+    r = false;
   }
 
-
-
-  eprintk("Got here: %d == %d\n", numChars, d->keylen);
-  if (numChars == d->keylen) return true;
-
-  return false;
-  */
+  memset(userkey_in_k, 0, d->keylen);
+  memset(key_decryption_output, 0, d->keylen);
+  kfree(userkey_in_k);
+  kfree(key_decryption_output);
+  return r;
 }
 
 
@@ -275,7 +304,7 @@ static int decrypt_entire(osprd_info_t *d, char __user *key)
   int numChars;
   char *userkey;
   int ret;
-  //TODO: Add actual decryption
+  unsigned long sec;
 
   if (trykey_user(d, key))
   {
@@ -285,20 +314,20 @@ static int decrypt_entire(osprd_info_t *d, char __user *key)
 
     ret = copy_from_user(userkey, key, numChars);
 
-    if (strcmp(d->algo, sillycrypt_name) == 0)
+    for (sec = 0; sec < nsectors; sec++)
     {
-      eprintk("Sillydecrypting!\n");
-      silly_decrypt(d->data, SECTOR_SIZE*nsectors, userkey, d->keylen, 0);
+      d->eprof.decrypt_sector(d->data+sec*SECTOR_SIZE, d->data, userkey, 
+                              d->keylen, sec);
     }
-    else
-      return -ENOSYS;
+
   }
   else
   {
     return -EKEYREJECTED;
   }
 
-
+  memset(userkey, 0, numChars);
+  kfree(userkey);
   d->encrypted = false;
   return 0;
 }
@@ -308,7 +337,7 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
 {
   int numChars = 0;
   int ret;
-  //TODO: Add actual encryption
+  unsigned long sec;
   
   // ------------------------------------------------------------- SET THINGS UP
   // Find the length of the encryption key
@@ -318,14 +347,6 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
   d->key = kmalloc(numChars, GFP_ATOMIC);
 
   ret = copy_from_user(d->key, key, numChars);
-
-  
-
-  /*
-  eprintk("copy_from_user returned: %d\n", ret);
-  eprintk("d->key has |%s|\n", d->key);
-  eprintk("numchars is %d\n", numChars);
-  */
 
   d->keylen = numChars;
 
@@ -338,8 +359,8 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
   }
   else
   {
-    // if the user didn't provide an algoritm, we'd better have a previously used
-    //  one
+    // if the user didn't provide an algoritm, we'd better have a previously 
+    //  used one
     if (!d->algo)
     {
       return -ENOSYS;
@@ -347,59 +368,27 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
   }
 
   // ---------------------------------------------------------------- ENCRYPTION
-  /*  CONFUSION
-  struct scatterlist sg[2];
-  char output[SECTOR_SIZE];
-  struct crypto_tfm *transform;
-  
-  struct cipher_desc *description;
-  
-  
-
-  transform = crypto_alloc_tfm("ecb", 0);
-  if (IS_ERR(transform))
-  {
-    eprintk("Transform error\n");
-  }
-
-  description.desc = transform;
-  description.flags = 0;
-
-  ret = crypto_cipher_setkey(transform, "pass", 4);
-
-  if (ret)
-  {
-    eprintk("setkey error\n");
-  }
-
-  eprintk("Page size: %d\n", PAGE_SIZE);
-
-  sg_init_table(sg, 1);
-
-  sg_set_buf(sg, d->data, 512); 
-
-  ret = crypto_cipher_encrypt(transform, sg+1, sg, 512);
-  */
-
+  // (only sillycrypt supported)
   if (strcmp(d->algo, sillycrypt_name) == 0)
   {
-    /*
-    eprintk("Sillycrypting!\n");
-    */
-    silly_encrypt(d->data, SECTOR_SIZE*nsectors, d->key, d->keylen, 0);
+    d->eprof = silly_profile;
+  }
+  else if (0) // this would be where we'd place other encryption algorithms
+  {
+    // and assign the correct encryption profile
   }
   else
     return -ENOSYS;
 
-  silly_encrypt(d->key, d->keylen, d->key, d->keylen, 0);
+  for (sec = 0; sec < nsectors; sec++)
+  {
+    d->eprof.encrypt_sector(d->data, d->data+sec*SECTOR_SIZE, d->key, 
+                            d->keylen, sec);
+  }
+
+  d->eprof.encrypt_key(d->key, d->key, d->key, d->keylen);
 
   d->encrypted = true;
-/*
-  eprintk("keylen is: %d\n", d->keylen);
-
-
-  eprintk("New algo: %s\n", d->algo);
-  */
   
   return 0;
 }
@@ -407,100 +396,181 @@ static int encrypt_entire(osprd_info_t *d, char __user *key, char __user *algo)
 static ssize_t eosprd_read(struct file *filp, char __user *buf, size_t length, 
     loff_t *offset)
 {
-  int numFailed;
+  unsigned long curSector;
+  size_t bytesToRead;
+  size_t totalRead = 0;
+  size_t numFailed;
+  uint8_t *kbuffer = kmalloc(SECTOR_SIZE, GFP_ATOMIC);
 
   osprd_info_t *d = file2osprd(filp);
 
   if(buf == 0) return -EFAULT;
 
+  if(*offset >= nsectors*SECTOR_SIZE)
+      return 0;
+
+
   if (d->encrypted) // ----------------------------------------- ENCRYPTED READ
   {
-    /*
-    eprintk("here!\n");
-    eprintk("%s\n", (char *) filp->f_security);
-    */
+
     if(filp->f_security && trykey_k(d, filp->f_security))
     {
-      /*
-      eprintk("and here!\n");
-      */
-      if(*offset >= nsectors*SECTOR_SIZE)
-        return 0;
+      for(curSector = 0; curSector < nsectors; curSector++)
+      {
+        // if at least part of this sector should be read
+        if(*offset < (curSector+1)*SECTOR_SIZE)
+        {
+          bytesToRead = (curSector+1)*SECTOR_SIZE - *offset;
+          if (bytesToRead > length) bytesToRead = length;
 
-//      eprintk("Pre decrypt %02x\n", *(d->data + *offset));
-      silly_decrypt(d->data + *offset, length, filp->f_security, d->keylen,
-                    modulo((*offset),d->keylen));
 
-//      eprintk("After decrypt %02x\n", *(d->data + *offset));
+          d->eprof.decrypt_sector(kbuffer, d->data, filp->f_security, 
+                                  d->keylen, curSector);
 
-      numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
-                               length);
 
-      silly_encrypt(d->data + *offset, length, filp->f_security, d->keylen,
-                    modulo((*offset),d->keylen));
+          numFailed = copy_to_user(buf, kbuffer + (*offset)%SECTOR_SIZE,
+                          bytesToRead);
 
-//      eprintk("Re decrypt %02x\n", *(d->data + *offset));
+          if(numFailed)
+            eprintk("copy_to_user did not complete successfully\n");
 
-      *offset += (length - numFailed);
-      return length - numFailed;
+          bytesToRead -= numFailed;
+
+          totalRead += bytesToRead;
+          buf += bytesToRead;
+          *offset += bytesToRead;
+          length -= bytesToRead;
+
+          if (length <= 0) break;
+        }
+      }
+    }
+
+    return totalRead;
+  }
+
+  // -------------------------------------------------------------- NORMAL READ
+  for(curSector = 0; curSector < nsectors; curSector++)
+  {
+    // if at least part of this sector should be read
+    if(*offset < (curSector+1)*SECTOR_SIZE)
+    {
+      bytesToRead = (curSector+1)*SECTOR_SIZE - *offset;
+      if (bytesToRead > length) bytesToRead = length;
+
+      osprd_read_sector(kbuffer, d->data, curSector);
+
+      numFailed = copy_to_user(buf, kbuffer + *offset%SECTOR_SIZE,
+                      bytesToRead);
+
+      if(numFailed)
+        eprintk("copy_to_user did not complete successfully\n");
+
+      totalRead += bytesToRead;
+      buf += bytesToRead;
+      *offset += bytesToRead;
+      length -= bytesToRead;
+
+      if (length <= 0) break;
     }
   }
-  // -------------------------------------------------------------- NORMAL READ
-  if(*offset >= nsectors*SECTOR_SIZE)
-    return 0;
 
-  numFailed = copy_to_user((void *)(buf), (const void *)(d->data + *offset), 
-                           length);
-
-  *offset += (length - numFailed);
-  return length - numFailed;
-
+  return totalRead;
 }
 
 
 static ssize_t eosprd_write(struct file *filp, const char __user *buf, 
     size_t length, loff_t *offset)
 {
-  int numFailed;
+  unsigned long curSector;
+  size_t bytesToRead;
+  size_t totalRead = 0;
+  size_t numFailed;
+  uint8_t *kbuffer = kmalloc(SECTOR_SIZE, GFP_ATOMIC);
   
   osprd_info_t *d = file2osprd(filp);
 
   if(buf == 0) return -EFAULT;
 
+  if(*offset >= nsectors*SECTOR_SIZE)
+    return 0;
+
   if (d->encrypted) // --------------------------------------- ENCRYPTED WRITE
   {
     if(filp->f_security && trykey_k(d, filp->f_security))
     {
-      if(*offset >= nsectors*SECTOR_SIZE)
-        return 0;
+      for(curSector = 0; curSector < nsectors; curSector++)
+      {
+        // if at least part of this sector should be written 
+        if(*offset < (curSector+1)*SECTOR_SIZE)
+        {
+          bytesToRead = (curSector+1)*SECTOR_SIZE - *offset;
+          if (bytesToRead > length) bytesToRead = length;
 
-      numFailed = copy_from_user((void *)(d->data + *offset), 
-                                 (const void*)(buf), length);
+          // read in and decrypt a copy of the sector we'll be writing to 
+          d->eprof.decrypt_sector(kbuffer, d->data, filp->f_security, 
+                                  d->keylen, curSector);
 
-      silly_encrypt(d->data + *offset, length, filp->f_security, d->keylen,
-                    modulo((*offset),d->keylen));
+          // replace a portion (or all) of that copy with the user data
+          numFailed = copy_from_user(kbuffer + *offset%SECTOR_SIZE, buf,
+                          bytesToRead);
 
-      *offset += (length - numFailed);
-      return length - numFailed;
+          // encrypt and write the new sector back to disk
+          d->eprof.encrypt_sector(d->data, kbuffer, filp->f_security,
+                                  d->keylen, curSector);
+
+          if(numFailed)
+            eprintk("copy_to_user did not complete successfully\n");
+
+          totalRead += bytesToRead;
+          buf += bytesToRead;
+          *offset += bytesToRead;
+          length -= bytesToRead;
+
+          if (length <= 0) break;
+        }
+      }
+      return totalRead;
+
     }
     else
     {
       return -EKEYREJECTED;
     }
   }
-  else // ------------------------------------------------------- NORMAL WRITE
-  {
-    if(*offset >= nsectors*SECTOR_SIZE)
-      return 0;
 
-    if(buf != 0)
+  // ------------------------------------------------------------ NORMAL WRITE
+  for(curSector = 0; curSector < nsectors; curSector++)
+  {
+    // if at least part of this sector should be written 
+    if(*offset < (curSector+1)*SECTOR_SIZE)
     {
-      numFailed = copy_from_user((void *)(d->data + *offset), 
-                                 (const void*)(buf), length);
+      bytesToRead = (curSector+1)*SECTOR_SIZE - *offset;
+      if (bytesToRead > length) bytesToRead = length;
+
+      // read in a copy of the sector we'll be writing to 
+      osprd_read_sector(kbuffer, d->data, curSector);
+
+      // replace a portion (or all) of that copy with the user data
+      numFailed = copy_from_user(kbuffer + *offset%SECTOR_SIZE, buf,
+                      bytesToRead);
+
+      // write the new sector back to disk
+      osprd_write_sector(d->data, kbuffer, curSector);
+
+      if(numFailed)
+        eprintk("copy_to_user did not complete successfully\n");
+
+      totalRead += bytesToRead;
+      buf += bytesToRead;
+      *offset += bytesToRead;
+      length -= bytesToRead;
+
+      if (length <= 0) break;
     }
-    *offset += length;
-    return length - numFailed;
   }
+
+  return totalRead;
 }
 
 #if 0
@@ -570,6 +640,12 @@ static int osprd_open(struct inode *inode, struct file *filp)
   // Always set the O_SYNC flag. That way, we will get writes immediately
   // instead of waiting for them to get through write-back caches.
   filp->f_flags |= O_SYNC;
+  osprd_info_t *d = file2osprd(filp);
+
+  osp_spin_lock(&d->mutex);
+  d->enumopen++;
+  osp_spin_unlock(&d->mutex);
+  
   return 0;
 }
 
@@ -607,7 +683,6 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
      {
        osp_spin_lock(&d->mutex);
        d->w_lock = 0;
-       //eprintk("I released my write lock!\n");
      }
       struct pid_list *curr = d->pids;
       struct pid_list **prev = &(d->pids);
@@ -1009,7 +1084,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
      {
        osp_spin_lock(&d->mutex);
        d->w_lock = 0;
-       //eprintk("I released my write lock!\n");
      }
       curr = d->pids;
       prev = &(d->pids);
@@ -1034,6 +1108,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
   {
     char *key = (char *) arg;
 
+
     if (!key)
     {
       if (d->encrypted)
@@ -1049,17 +1124,13 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
     else if (trykey_user(d, key))
     {
       char *ci = key;
-      int nChars = 0;
+      int nChars = strnlen_user(key, 1024);
       char *keycopy;
-      //eprintk("user key accepted");
-      for ( ; *ci != 0; ci++)
-      {
-        nChars++;
-      }
+
 
       // Save the key in kernel memory, give the file a pointer to it
-      keycopy = kmalloc(nChars+1, GFP_ATOMIC);
-      memcpy(keycopy, key, nChars+1);
+      keycopy = kmalloc(nChars, GFP_ATOMIC);
+      memcpy(keycopy, key, nChars);
 
       filp->f_security = keycopy;
 
@@ -1074,6 +1145,15 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
   else if (cmd == EOSPRDIOCENCRYPT)
   {
     struct encrypt_args *keys = (struct encrypt_args *) arg;
+
+    osp_spin_lock(&d->mutex);
+    // if any other files are using this ramdisk, we can't encrypt right now
+    if (d->enumopen > 1)
+    {
+      osp_spin_unlock(&d->mutex);
+      return -EBUSY;
+    }
+    osp_spin_unlock(&d->mutex);
 
     // If encrypted, decrypt it
     if (d->encrypted)
@@ -1140,6 +1220,7 @@ static void osprd_setup(osprd_info_t *d)
   d->keylen = 0;
   d->algo = 0;
   d->algolen= 0;
+  d->enumopen = 0;
   /* Add code here if you add fields to osprd_info_t. */
 }
 
@@ -1172,6 +1253,11 @@ static int (*blkdev_release)(struct inode *, struct file *);
 
 static int _osprd_release(struct inode *inode, struct file *filp)
 {
+  osprd_info_t *d = file2osprd(filp);
+  osp_spin_lock(&d->mutex);
+  d->enumopen--;
+  osp_spin_unlock(&d->mutex);
+
   if (file2osprd(filp))
     osprd_close_last(inode, filp);
   return (*blkdev_release)(inode, filp);
@@ -1312,7 +1398,6 @@ static int setup_device(osprd_info_t *d, int which)
   return 0;
 }
 
-static void osprd_exit(void);
 
 
 // The kernel calls this function when the module is loaded.
